@@ -20,7 +20,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://127.0.0.1:5173"
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "https://satquery-ai-hazel.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1142,69 +1145,52 @@ Return the answer in simple language.
 # --------------------------------------------------
 
 @app.post("/api/chat")
-async def chat(
-    question: str = Form(...)
-):
-
+async def ask_satquery(question: str = Form(...)):
     if not question.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Question is required."
-        )
+        raise HTTPException(status_code=400, detail="Question is required.")
 
     prompt = f"""
-You are SatQuery AI, an interactive remote sensing
-and satellite image analysis assistant.
+You are SatQuery AI, an assistant specializing in remote sensing,
+satellite imagery, geography, environmental analysis, agriculture,
+and disaster assessment.
 
-The user has asked:
+Answer the user's question clearly and accurately.
+If the question is general, answer it normally.
+Do not invent satellite data, live location data, property records,
+or information that you do not have.
 
+User question:
 {question}
-
-Answer the user's question clearly and simply.
-
-If the question is related to satellite imagery,
-remote sensing, geography, environment, agriculture,
-floods, construction, land use, disasters, or
-changes in an area, explain it in an easy-to-understand
-way.
-
-IMPORTANT:
-- Do not invent satellite data.
-- Do not claim access to live satellite imagery unless
-  it is actually provided.
-- Do not claim exact property ownership.
-- Do not provide legal or financial certification.
-- Clearly distinguish between visible evidence and
-  information that would require official data.
-
-Keep the answer useful and beginner-friendly.
 """
 
-    try:
+    last_error = None
 
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt
-        )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=prompt
+            )
 
-        answer = response.text
+            return {
+                "status": "success",
+                "feature": "Ask SatQuery",
+                "question": question,
+                "response": response.text
+            }
 
-        if not answer:
-            raise Exception("Gemini returned an empty response.")
+        except Exception as e:
+            last_error = e
 
-    except Exception as e:
+            if attempt < 2:
+                import asyncio
+                await asyncio.sleep(2)
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Chat failed: {repr(e)}"
-        )
+    raise HTTPException(
+        status_code=503,
+        detail="SatQuery AI is temporarily busy. Please try again in a moment."
+    )
 
-    return {
-        "status": "success",
-        "feature": "Ask SatQuery",
-        "question": question,
-        "response": answer
-    }
 # --------------------------------------------------
 # GPS LOCATION
 # --------------------------------------------------
