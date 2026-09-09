@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from dotenv import load_dotenv
 from google import genai
@@ -10,7 +11,18 @@ import io
 load_dotenv()
 
 # Create FastAPI app
-app = FastAPI(
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
     title="SatQuery AI",
     description="Interactive Vision-Language Assistant for Remote Sensing Image Analysis",
     version="1.0.0"
@@ -1216,3 +1228,9 @@ async def save_location(location: LocationRequest):
         "longitude": location.longitude,
         "message": "Location received successfully."
     }
+if __name__ == "__main__":
+    import uvicorn
+    import os
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
