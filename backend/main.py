@@ -1,9 +1,11 @@
-
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from PIL import Image
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
 import os
 import io
 
@@ -11,6 +13,7 @@ import io
 load_dotenv()
 
 # Create FastAPI app
+
 app = FastAPI()
 
 app.add_middleware(
@@ -22,10 +25,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-    title="SatQuery AI",
-    description="Interactive Vision-Language Assistant for Remote Sensing Image Analysis",
-    version="1.0.0"
 )
 
 # Get Gemini API key
