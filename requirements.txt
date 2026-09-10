@@ -7,3 +7,4 @@ google-genai
 yolov5
 torch
 torchvision
+setuptools
