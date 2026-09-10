@@ -4,3 +4,6 @@ python-multipart
 pillow
 python-dotenv
 google-genai
+yolov5
+torch
+torchvision
