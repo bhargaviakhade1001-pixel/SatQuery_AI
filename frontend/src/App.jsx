@@ -1,7 +1,7 @@
 import { useState } from "react";
 import "./App.css";
 
-const API_URL = "https://satqueryai-production-c254.up.railway.app";
+const API_URL = "http://127.0.0.1:8000";
 
 const features = [
   {
@@ -51,14 +51,37 @@ function App() {
   const [location, setLocation] = useState(null);
   const [locationText, setLocationText] = useState("");
 
+  // Gemini/VLM and YOLO use separate result states.
+  const [vlmResult, setVlmResult] = useState("");
+  const [detectionResult, setDetectionResult] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+
   const selectFeature = (feature) => {
     setSelectedFeature(feature);
     setImage(null);
     setAnswer("");
+    setVlmResult("");
+    setDetectionResult(null);
+
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(null);
+
     window.scrollTo({
       top: document.body.scrollHeight,
       behavior: "smooth",
     });
+  };
+
+  const handleImageChange = (file) => {
+    if (!file) return;
+
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+
+    setImage(file);
+    setAnswer("");
+    setVlmResult("");
+    setDetectionResult(null);
+    setPreviewUrl(URL.createObjectURL(file));
   };
 
   const startVoice = () => {
@@ -80,8 +103,7 @@ function App() {
     recognition.start();
 
     recognition.onresult = (event) => {
-      const spokenText = event.results[0][0].transcript;
-      setQuestion(spokenText);
+      setQuestion(event.results[0][0].transcript);
       setListening(false);
     };
 
@@ -90,44 +112,66 @@ function App() {
       alert("Could not understand your voice. Please try again.");
     };
 
-    recognition.onend = () => {
-      setListening(false);
-    };
+    recognition.onend = () => setListening(false);
   };
 
-  const askSatQuery = async () => {
+  // ============================================================
+  // GEMINI / VLM - TEXT ONLY
+  // ============================================================
+
+  const askImageQuestion = async () => {
+    if (!image) {
+      alert("Please select a satellite image first.");
+      return;
+    }
+
     if (!question.trim()) {
-      alert("Please enter a question first.");
+      alert("Please enter a question about the image.");
       return;
     }
 
     setLoading(true);
     setAnswer("");
+    setVlmResult("");
+    setDetectionResult(null);
 
     const formData = new FormData();
-    formData.append("question", question);
+    formData.append("image", image);
+    formData.append("query", question);
 
     try {
-      const response = await fetch(`${API_URL}/api/chat`, {
+      const response = await fetch(`${API_URL}/api/analyze`, {
         method: "POST",
         body: formData,
       });
 
       const data = await response.json();
 
-      if (response.ok) {
-        setAnswer(data.response);
-      } else {
-        setAnswer(data.detail || "Something went wrong.");
+      if (!response.ok) {
+        setVlmResult(data.detail || "Image analysis failed.");
+        return;
       }
+
+      // Gemini/VLM is always displayed as normal text.
+      setVlmResult(
+        data.analysis || "SatQuery AI could not generate an analysis."
+      );
+
+      // Never populate the YOLO result state here.
+      setDetectionResult(null);
     } catch (error) {
-      setAnswer(
+      console.error("VLM error:", error);
+      setVlmResult(
         "Cannot connect to SatQuery AI. Please make sure the backend is running."
       );
     } finally {
       setLoading(false);
     }
   };
+
+  // ============================================================
+  // FEATURE ANALYSIS
+  // ============================================================
 
   const analyzeImage = async () => {
     if (!image) {
@@ -147,12 +191,14 @@ function App() {
     const endpoint = endpoints[selectedFeature];
 
     if (!endpoint) {
-      alert("This feature requires two images and will be added next.");
+      alert("This feature requires additional image processing.");
       return;
     }
 
     setLoading(true);
     setAnswer("");
+    setVlmResult("");
+    setDetectionResult(null);
 
     const formData = new FormData();
     formData.append("image", image);
@@ -166,11 +212,72 @@ function App() {
       const data = await response.json();
 
       if (response.ok) {
-        setAnswer(data.analysis);
+        setVlmResult(data.analysis || "Analysis completed.");
       } else {
-        setAnswer(data.detail || "Analysis failed.");
+        setVlmResult(data.detail || "Analysis failed.");
       }
     } catch (error) {
+      console.error("Feature analysis error:", error);
+      setVlmResult(
+        "Cannot connect to SatQuery AI. Please make sure the backend is running."
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ============================================================
+  // YOLO OBJECT DETECTION
+  // ============================================================
+
+  const runDetection = async () => {
+    if (!image) {
+      alert("Please select a satellite image first.");
+      return;
+    }
+
+    setLoading(true);
+    setAnswer("");
+    setVlmResult("");
+    setDetectionResult(null);
+
+    const query =
+      question.trim() ||
+      "Detect buildings, roads, vehicles and other visible objects.";
+
+    const formData = new FormData();
+    formData.append("image", image);
+    formData.append("query", query);
+
+    try {
+      const response = await fetch(`${API_URL}/api/analyze`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        setAnswer(data.detail || "Object detection failed.");
+        return;
+      }
+
+      // Only create YOLO state when actual YOLO data is returned.
+      if (
+        data.route === "detection" &&
+        data.annotated_image &&
+        Array.isArray(data.detections)
+      ) {
+        setDetectionResult(data);
+        setAnswer(data.analysis || "Objects detected successfully.");
+        setVlmResult("");
+      } else {
+        // Never show an empty YOLO dashboard for VLM output.
+        setDetectionResult(null);
+        setVlmResult(data.analysis || "The image was analyzed.");
+      }
+    } catch (error) {
+      console.error("Detection error:", error);
       setAnswer(
         "Cannot connect to SatQuery AI. Please make sure the backend is running."
       );
@@ -178,6 +285,10 @@ function App() {
       setLoading(false);
     }
   };
+
+  // ============================================================
+  // LOCATION
+  // ============================================================
 
   const useMyLocation = () => {
     if (!navigator.geolocation) {
@@ -199,10 +310,7 @@ function App() {
             headers: {
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({
-              latitude,
-              longitude,
-            }),
+            body: JSON.stringify({ latitude, longitude }),
           });
         } catch (error) {
           console.log("Location backend connection failed.");
@@ -216,13 +324,117 @@ function App() {
     );
   };
 
+  // ============================================================
+  // DETECTION STATISTICS
+  // ============================================================
+
+  const detectionEntries = detectionResult
+    ? Object.entries(detectionResult.counts || {}).sort(
+      ([, a], [, b]) => b - a
+    )
+    : [];
+
+  const totalDetections = detectionEntries.reduce(
+    (total, [, count]) => total + count,
+    0
+  );
+
+  const vehicleClasses = [
+    "Small Car",
+    "Passenger Car",
+    "Truck",
+    "Cargo Truck",
+    "Truck w/Box",
+    "Bus",
+  ];
+
+  const vehicleCount = vehicleClasses.reduce(
+    (total, className) =>
+      total + (detectionResult?.counts?.[className] || 0),
+    0
+  );
+
+  const averageConfidence =
+    detectionResult?.detections?.length > 0
+      ? Math.round(
+        (detectionResult.detections.reduce(
+          (sum, item) => sum + item.confidence,
+          0
+        ) /
+          detectionResult.detections.length) *
+        100
+      )
+      : 0;
+
+  // ============================================================
+  // FORMAT GEMINI ANSWER
+  // ============================================================
+
+  const formatAnswer = (text) => {
+    if (!text) return null;
+
+    const lines = text
+      .replace(/\*\*/g, "")
+      .replace(/^#+\s*/gm, "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    return lines.map((line, index) => {
+      const lower = line.toLowerCase();
+
+      if (
+        lower.includes("detailed observations") ||
+        lower.includes("key observations") ||
+        lower.includes("visible observations") ||
+        lower.includes("overall assessment") ||
+        lower.includes("recommendation")
+      ) {
+        return (
+          <h3 key={index} className="answer-heading">
+            {line.replace(/:$/, "")}
+          </h3>
+        );
+      }
+
+      if (/^[-*•]\s*/.test(line)) {
+        const cleaned = line.replace(/^[-*•]\s*/, "");
+        const colonIndex = cleaned.indexOf(":");
+
+        if (colonIndex > 0 && colonIndex < 45) {
+          return (
+            <div key={index} className="answer-point">
+              <span className="answer-bullet">•</span>
+              <p>
+                <strong>{cleaned.slice(0, colonIndex)}:</strong>{" "}
+                {cleaned.slice(colonIndex + 1).trim()}
+              </p>
+            </div>
+          );
+        }
+
+        return (
+          <div key={index} className="answer-point">
+            <span className="answer-bullet">•</span>
+            <p>{cleaned}</p>
+          </div>
+        );
+      }
+
+      return (
+        <p key={index} className="answer-paragraph">
+          {line}
+        </p>
+      );
+    });
+  };
+
   return (
     <div className="app">
       {/* HEADER */}
       <header>
         <div className="brand">
           <div className="brand-icon">🛰️</div>
-
           <div>
             <h1>
               Sat<span>Query</span> AI
@@ -254,7 +466,6 @@ function App() {
             your surroundings with simple AI-powered questions.
           </p>
 
-          {/* LOCATION SEARCH */}
           <div className="location-search">
             <div className="search-icon">🔎</div>
 
@@ -310,9 +521,7 @@ function App() {
           <div className="map-center">
             <div className="map-center-icon">🛰️</div>
             <p>Satellite Intelligence Map</p>
-            <small>
-              Search a location to begin exploring
-            </small>
+            <small>Search a location to begin exploring</small>
           </div>
         </section>
 
@@ -320,9 +529,7 @@ function App() {
         <section>
           <div className="section-title">
             <h2>What do you want to investigate?</h2>
-            <p>
-              Choose a purpose and let SatQuery AI analyze the area.
-            </p>
+            <p>Choose a purpose and let SatQuery AI analyze the area.</p>
           </div>
 
           <div className="feature-grid">
@@ -333,27 +540,84 @@ function App() {
                 onClick={() => selectFeature(feature.name)}
               >
                 <div className="feature-icon">{feature.icon}</div>
-
                 <h3>{feature.name}</h3>
-
                 <p>{feature.description}</p>
               </button>
             ))}
           </div>
         </section>
 
-        {/* IMAGE ANALYSIS */}
-        {selectedFeature && (
+        {/* QUICK OBJECT DETECTION */}
+        <section className="detection-section">
+          <div className="section-title">
+            <div>
+              <div className="selected-label">COMPUTER VISION</div>
+
+              <h2>📦 Object Detection</h2>
+
+              <p>
+                Detect buildings, vehicles and other objects directly from
+                satellite imagery.
+              </p>
+            </div>
+          </div>
+
+          <label className="upload-box">
+            <div className="upload-icon">🛰️</div>
+
+            <strong>
+              {image ? image.name : "Drop your satellite image here"}
+            </strong>
+
+            <span>
+              {image
+                ? "Image selected"
+                : "or click to browse • JPG, PNG, WEBP"}
+            </span>
+
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/jpg,image/webp"
+              onChange={(e) => handleImageChange(e.target.files[0])}
+            />
+          </label>
+
+          {previewUrl && (
+            <div className="image-preview">
+              <div className="preview-header">
+                <span>INPUT IMAGE</span>
+                <span>READY FOR ANALYSIS</span>
+              </div>
+
+              <img src={previewUrl} alt="Uploaded satellite" />
+            </div>
+          )}
+
+          <div className="detection-query">
+            <input
+              type="text"
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder="Example: Detect buildings, cars and trucks..."
+            />
+
+            <button
+              className="analyze-button"
+              onClick={runDetection}
+              disabled={loading || !image}
+            >
+              {loading ? "Running..." : "Result"}
+            </button>
+          </div>
+        </section>
+
+        {/* OTHER FEATURE ANALYSIS */}
+        {selectedFeature && selectedFeature !== "What Changed?" && (
           <section className="upload-section">
             <div className="analysis-heading">
               <div>
-                <div className="selected-label">
-                  SELECTED ANALYSIS
-                </div>
-
-                <h2>
-                  {selectedFeature}
-                </h2>
+                <div className="selected-label">SELECTED ANALYSIS</div>
+                <h2>{selectedFeature}</h2>
               </div>
 
               <button
@@ -362,68 +626,317 @@ function App() {
                   setSelectedFeature("");
                   setImage(null);
                   setAnswer("");
+                  setVlmResult("");
+                  setDetectionResult(null);
+
+                  if (previewUrl) URL.revokeObjectURL(previewUrl);
+                  setPreviewUrl(null);
                 }}
               >
                 ✕
               </button>
             </div>
 
-            {selectedFeature === "What Changed?" ? (
-              <div className="coming-soon">
-                <div>🔍</div>
-                <h3>Before & After Analysis</h3>
-                <p>
-                  This feature requires two satellite images and will
-                  be connected next.
-                </p>
+            <p>
+              Upload an overhead or satellite image for{" "}
+              <strong>{selectedFeature}</strong>.
+            </p>
+
+            <label className="upload-box">
+              <div className="upload-icon">☁️</div>
+
+              <strong>
+                {image ? image.name : "Drop your satellite image here"}
+              </strong>
+
+              <span>
+                {image
+                  ? "Image selected"
+                  : "or click to browse • JPG, PNG, WEBP"}
+              </span>
+
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/jpg,image/webp"
+                onChange={(e) => handleImageChange(e.target.files[0])}
+              />
+            </label>
+
+            <button
+              className="analyze-button"
+              onClick={analyzeImage}
+              disabled={loading || !image}
+            >
+              {loading ? "🔄 Analyzing..." : "🔍 Analyze with SatQuery AI"}
+            </button>
+
+            {/* GEMINI IMAGE QUESTION */}
+            <div className="image-question-box">
+              <div className="question-label">
+                💬 Ask about this image
               </div>
-            ) : (
-              <>
-                <p>
-                  Upload an overhead or satellite image for{" "}
-                  <strong>{selectedFeature}</strong>.
-                </p>
 
-                <label className="upload-box">
-                  <div className="upload-icon">☁️</div>
+              <textarea
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                placeholder="Example: Is this area urban or rural?"
+                rows={3}
+              />
 
-                  <strong>
-                    {image
-                      ? image.name
-                      : "Drop your satellite image here"}
-                  </strong>
-
-                  <span>
-                    {image
-                      ? "Image selected"
-                      : "or click to browse • JPG, PNG, WEBP"}
-                  </span>
-
-                  <input
-                    type="file"
-                    accept="image/png,image/jpeg,image/jpg,image/webp"
-                    onChange={(e) =>
-                      setImage(e.target.files[0])
-                    }
-                  />
-                </label>
-
+              <div className="question-actions">
                 <button
-                  className="analyze-button"
-                  onClick={analyzeImage}
+                  type="button"
+                  className="voice-button"
+                  onClick={startVoice}
                   disabled={loading}
                 >
-                  {loading
-                    ? "🔄 Analyzing..."
-                    : "🔍 Analyze with SatQuery AI"}
+                  {listening ? "🎤 Listening..." : "🎤 Speak"}
                 </button>
-              </>
-            )}
+
+                <button
+                  type="button"
+                  className="ask-button"
+                  onClick={askImageQuestion}
+                  disabled={loading || !image}
+                >
+                  {loading ? "🛰️ Analyzing..." : "Ask SatQuery →"}
+                </button>
+              </div>
+
+              <div className="suggested-questions">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuestion("Is this area urban or rural?")
+                  }
+                >
+                  Urban or rural?
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuestion("Describe the land use in this area.")
+                  }
+                >
+                  Land use
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuestion("What vegetation is visible?")
+                  }
+                >
+                  Vegetation
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuestion("Are there roads visible?")
+                  }
+                >
+                  Roads
+                </button>
+              </div>
+            </div>
           </section>
         )}
 
-        {/* RESULT */}
-        {(loading || answer) && (
+        {/* WHAT CHANGED */}
+        {selectedFeature === "What Changed?" && (
+          <section className="upload-section">
+            <div className="analysis-heading">
+              <div>
+                <div className="selected-label">CHANGE ANALYSIS</div>
+                <h2>🔍 What Changed?</h2>
+              </div>
+
+              <button
+                className="close-button"
+                onClick={() => setSelectedFeature("")}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="coming-soon">
+              <div>🔍</div>
+              <h3>Before & After Analysis</h3>
+              <p>
+                Upload two satellite images to identify visible changes.
+                Visual change highlighting will be added next.
+              </p>
+            </div>
+          </section>
+        )}
+
+        {/* YOLO DETECTION RESULTS */}
+        {detectionResult &&
+          detectionResult.route === "detection" &&
+          detectionResult.annotated_image &&
+          Array.isArray(detectionResult.detections) &&
+          !loading && (
+            <section className="detection-results">
+              <div className="result-header">
+                <div>
+                  <div className="selected-label">
+                    COMPUTER VISION OUTPUT
+                  </div>
+
+                  <h2>🛰️ Satellite Intelligence Results</h2>
+                </div>
+
+                <div className="ai-badge">YOLO xVIEW</div>
+              </div>
+
+              <div className="stats-grid">
+                <div className="stat-card">
+                  <span className="stat-icon">🎯</span>
+                  <span className="stat-label">OBJECTS DETECTED</span>
+                  <strong>{totalDetections}</strong>
+                </div>
+
+                <div className="stat-card">
+                  <span className="stat-icon">🏢</span>
+                  <span className="stat-label">BUILDINGS</span>
+                  <strong>
+                    {detectionResult.counts?.Building || 0}
+                  </strong>
+                </div>
+
+                <div className="stat-card">
+                  <span className="stat-icon">🚗</span>
+                  <span className="stat-label">VEHICLES</span>
+                  <strong>{vehicleCount}</strong>
+                </div>
+
+                <div className="stat-card">
+                  <span className="stat-icon">📊</span>
+                  <span className="stat-label">AVG CONFIDENCE</span>
+                  <strong>{averageConfidence}%</strong>
+                </div>
+              </div>
+
+              <div className="results-layout">
+                <div className="annotated-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <span>PROCESSED IMAGE</span>
+                      <h3>Detected Objects</h3>
+                    </div>
+
+                    <span className="live-indicator">● ANALYZED</span>
+                  </div>
+
+                  <div className="annotated-image-wrapper">
+                    <img
+                      src={`${API_URL}${detectionResult.annotated_image}`}
+                      alt="YOLO object detection result"
+                    />
+                  </div>
+                </div>
+
+                <div className="objects-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <span>DETECTION SUMMARY</span>
+                      <h3>Objects Found</h3>
+                    </div>
+                  </div>
+
+                  <div className="object-count-list">
+                    {detectionEntries.length === 0 ? (
+                      <div className="empty-detection">
+                        No relevant objects detected.
+                      </div>
+                    ) : (
+                      detectionEntries.map(([name, count]) => (
+                        <div
+                          className="object-count-row"
+                          key={name}
+                        >
+                          <div>
+                            <span className="object-dot"></span>
+                            <span>{name}</span>
+                          </div>
+
+                          <strong>{count}</strong>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="analysis-summary">
+                    <span>AI ANALYSIS</span>
+                    <p>{answer}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="detection-table-panel">
+                <div className="panel-heading">
+                  <div>
+                    <span>RAW COMPUTER VISION RESULTS</span>
+                    <h3>Individual Detections</h3>
+                  </div>
+
+                  <span>
+                    {detectionResult.detections?.length || 0} records
+                  </span>
+                </div>
+
+                <div className="detection-table">
+                  <div className="table-row table-head">
+                    <span>#</span>
+                    <span>OBJECT</span>
+                    <span>CONFIDENCE</span>
+                    <span>BOUNDING BOX</span>
+                  </div>
+
+                  {(detectionResult.detections || []).map(
+                    (detection, index) => (
+                      <div
+                        className="table-row"
+                        key={`${detection.class}-${index}`}
+                      >
+                        <span>{index + 1}</span>
+
+                        <span className="object-name">
+                          {detection.class}
+                        </span>
+
+                        <span>
+                          <div className="confidence-bar">
+                            <div
+                              className="confidence-fill"
+                              style={{
+                                width: `${detection.confidence * 100
+                                  }%`,
+                              }}
+                            ></div>
+                          </div>
+
+                          {Math.round(
+                            detection.confidence * 100
+                          )}
+                          %
+                        </span>
+
+                        <span className="box-value">
+                          [{detection.box.join(", ")}]
+                        </span>
+                      </div>
+                    )
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+
+        {/* GEMINI / VLM TEXT RESULT */}
+        {(loading || vlmResult) && !detectionResult && (
           <section className="result-section">
             <div className="result-header">
               <div>
@@ -434,57 +947,28 @@ function App() {
                 <h2>🛰️ Intelligence Result</h2>
               </div>
 
-              <div className="ai-badge">AI ASSISTED</div>
+              <div className="ai-badge">GEMINI VLM</div>
             </div>
 
             <div className="result-content">
               {loading ? (
                 <div className="loading">
                   <div className="loading-icon">🛰️</div>
+
                   <h3>Analyzing your request...</h3>
+
                   <p>
-                    SatQuery AI is examining the available information.
+                    SatQuery AI is examining the satellite imagery.
                   </p>
                 </div>
               ) : (
-                <p>{answer}</p>
+                <div className="formatted-answer">
+                  {formatAnswer(vlmResult)}
+                </div>
               )}
             </div>
           </section>
         )}
-
-        {/* ASK SATQUERY */}
-        <section className="chat-section">
-          <div className="section-title">
-            <h2>💬 Ask SatQuery</h2>
-            <p>
-              Have a question? Ask it naturally.
-            </p>
-          </div>
-
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Example: What should I check before buying land in this area?"
-          />
-
-          <div className="button-row">
-            <button onClick={startVoice}>
-              {listening
-                ? "🎤 Listening..."
-                : "🎤 Speak"}
-            </button>
-
-            <button
-              onClick={askSatQuery}
-              disabled={loading}
-            >
-              {loading
-                ? "🔄 Thinking..."
-                : "Ask SatQuery →"}
-            </button>
-          </div>
-        </section>
 
         {/* FOOTER */}
         <footer>

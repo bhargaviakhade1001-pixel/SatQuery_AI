@@ -1,20 +1,36 @@
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from ai.router.query_router import classify_query
+from ai.inference.detection import detect_objects
 
 from PIL import Image
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from pydantic import BaseModel
 
-import os
+import uuid
+import asyncio
 import io
+import os
+import tempfile
 
-# Load environment variables
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 load_dotenv()
 
-# Create FastAPI app
+app = FastAPI(title="SatQuery AI Backend")
 
-app = FastAPI()
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,136 +39,402 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:5174",
-        "https://satquery-ai-hazel.vercel.app"
+        "https://satquery-ai-hazel.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Get Gemini API key
+
+# ============================================================
+# GEMINI CONFIGURATION
+# ============================================================
+
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise RuntimeError("GEMINI_API_KEY is not configured in .env")
+    raise RuntimeError(
+        "GEMINI_API_KEY is not configured in .env"
+    )
 
-# Create Gemini client
 client = genai.Client(api_key=api_key)
 
 
-# --------------------------------------------------
-# HOME
-# --------------------------------------------------
+# ============================================================
+# IMAGE CONFIGURATION
+# ============================================================
 
-@app.get("/")
-def home():
-    return {
-        "message": "SatQuery AI Backend is running",
-        "status": "success"
-    }
-
-
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/jpg",
+    "image/webp",
+}
 
 
-# --------------------------------------------------
-# IMAGE UPLOAD
-# --------------------------------------------------
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
 
-@app.post("/api/upload-image")
-async def upload_image(image: UploadFile = File(...)):
+OUTPUT_DIR = "outputs"
+DETECTION_OUTPUT_DIR = os.path.join(
+    OUTPUT_DIR,
+    "detections",
+)
 
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
+os.makedirs(
+    DETECTION_OUTPUT_DIR,
+    exist_ok=True,
+)
 
-    if image.content_type not in allowed_types:
+
+# Serve generated images to the frontend
+app.mount(
+    "/outputs",
+    StaticFiles(directory=OUTPUT_DIR),
+    name="outputs",
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def validate_image_type(image: UploadFile) -> None:
+    """Validate uploaded image MIME type."""
+
+    if image.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
+            detail="Only JPG, PNG and WEBP images are supported.",
         )
 
-    image_data = await image.read()
 
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
+async def read_and_validate_image(
+    image: UploadFile,
+) -> bytes:
+    """Read and validate an uploaded image."""
 
-    return {
-        "status": "success",
-        "filename": image.filename,
-        "content_type": image.content_type,
-        "message": "Satellite image uploaded successfully."
-    }
+    validate_image_type(image)
 
-
-# --------------------------------------------------
-# GEMINI IMAGE ANALYSIS
-# --------------------------------------------------
-
-@app.post("/api/analyze")
-async def analyze_image(
-    image: UploadFile = File(...),
-    query: str = Form(...)
-):
-
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    # Check image type
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    # Check query
-    if not query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty."
-        )
-
-    # Read image
     image_data = await image.read()
 
     if not image_data:
         raise HTTPException(
             status_code=400,
-            detail="Image file is empty."
+            detail="Image file is empty.",
         )
 
-    # Validate image
     try:
-        img = Image.open(io.BytesIO(image_data))
+        img = Image.open(
+            io.BytesIO(image_data)
+        )
+
         img.verify()
+
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Invalid image file."
+            detail="Invalid image file.",
         )
 
-    # Gemini prompt
+    return image_data
+
+
+async def run_gemini_image_analysis(
+    image_data: bytes,
+    mime_type: str,
+    prompt: str,
+) -> str:
+    """Send an image and prompt to Gemini."""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[
+                types.Part.from_text(
+                    text=prompt
+                ),
+                types.Part.from_bytes(
+                    data=image_data,
+                    mime_type=mime_type,
+                ),
+            ],
+        )
+
+        analysis = response.text
+
+        if not analysis:
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
+
+        return analysis
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"VLM analysis failed: {repr(e)}",
+        )
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.get("/")
+def home():
+    return {
+        "message": "SatQuery AI Backend is running",
+        "status": "success",
+    }
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+    }
+
+
+# ============================================================
+# IMAGE UPLOAD
+# ============================================================
+
+@app.post("/api/upload-image")
+async def upload_image(
+    image: UploadFile = File(...),
+):
+    image_data = await read_and_validate_image(
+        image
+    )
+
+    return {
+        "status": "success",
+        "filename": image.filename,
+        "content_type": image.content_type,
+        "size": len(image_data),
+        "message": "Satellite image uploaded successfully.",
+    }
+
+
+# ============================================================
+# ANALYZE IMAGE
+# ============================================================
+
+@app.post("/api/analyze")
+async def analyze_image(
+    image: UploadFile = File(...),
+    query: str = Form(...),
+):
+    # --------------------------------------------------------
+    # Validate query
+    # --------------------------------------------------------
+
+    if not query.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Query cannot be empty.",
+        )
+
+    # --------------------------------------------------------
+    # Read and validate image
+    # --------------------------------------------------------
+
+    image_data = await read_and_validate_image(
+        image
+    )
+
+    # --------------------------------------------------------
+    # Classify user query
+    # --------------------------------------------------------
+
+    route_info = classify_query(query)
+
+    route = route_info["route"]
+    requested_class = route_info.get("requested_class")
+    show_all = route_info.get("show_all", True)
+
+    print(f"Query: {query}")
+    print(f"Route Info: {route_info}")
+
+    # ========================================================
+    # OBJECT DETECTION
+    # ========================================================
+
+    if route == "detection":
+
+        temp_image_path = None
+
+        try:
+            # ------------------------------------------------
+            # Create temporary image
+            # ------------------------------------------------
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".jpg",
+            ) as temp_file:
+
+                temp_file.write(
+                    image_data
+                )
+
+                temp_image_path = (
+                    temp_file.name
+                )
+
+            # ------------------------------------------------
+            # Create output filename
+            # ------------------------------------------------
+
+            output_path = os.path.join(
+                DETECTION_OUTPUT_DIR,
+                f"detected_{uuid.uuid4().hex}.jpg",
+            )
+
+            # ------------------------------------------------
+            # Run YOLO
+            # ------------------------------------------------
+
+            detection_result = detect_objects(
+                temp_image_path,
+                output_path=output_path,
+                requested_class=requested_class,
+                show_all=show_all,
+            )
+
+            # ------------------------------------------------
+            # Extract results
+            # ------------------------------------------------
+
+            counts = detection_result[
+                "counts"
+            ]
+
+            detections = detection_result[
+                "detections"
+            ]
+
+            annotated_image = detection_result[
+                "annotated_image"
+            ]
+
+            # ------------------------------------------------
+            # Create human-readable analysis
+            # ------------------------------------------------
+
+            if not counts:
+
+                analysis = (
+                    "No relevant objects were detected."
+                )
+
+            else:
+
+                analysis_lines = []
+
+                for name, count in sorted(
+                    counts.items()
+                ):
+                    analysis_lines.append(
+                        f"{name}: {count}"
+                    )
+
+                analysis = "\n".join(
+                    analysis_lines
+                )
+
+            # ------------------------------------------------
+            # Convert image path to frontend URL
+            # ------------------------------------------------
+
+            relative_image_path = os.path.relpath(
+                annotated_image,
+                OUTPUT_DIR,
+            )
+
+            annotated_image_url = (
+                "/outputs/"
+                + relative_image_path.replace(
+                    os.sep,
+                    "/",
+                )
+            )
+
+            # ------------------------------------------------
+            # Return detection result
+            # ------------------------------------------------
+
+            return {
+                "status": "success",
+                "route": "detection",
+                "query_type": (
+                    "all_objects"
+                    if show_all
+                    else "specific_object"
+                ),
+                "requested_class": requested_class,
+                "filename": image.filename,
+                "query": query,
+                "analysis": analysis,
+                "counts": counts,
+                "total_objects": sum(counts.values()),
+                "detections": detections,
+                "annotated_image": annotated_image_url,
+            }
+
+        except Exception as e:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Object detection failed: "
+                    f"{str(e)}"
+                ),
+            )
+
+        finally:
+
+            # ----------------------------------------------
+            # Delete temporary input image
+            # ----------------------------------------------
+
+            if (
+                temp_image_path
+                and os.path.exists(
+                    temp_image_path
+                )
+            ):
+                os.remove(
+                    temp_image_path
+                )
+
+    # ========================================================
+    # SEGMENTATION
+    # ========================================================
+
+    if route == "segmentation":
+
+        return {
+            "status": "success",
+            "route": "segmentation",
+            "query": query,
+            "analysis": (
+                "Segmentation module is not "
+                "connected yet."
+            ),
+        }
+
+    # ========================================================
+    # GENERAL GEMINI IMAGE ANALYSIS
+    # ========================================================
+
     prompt = f"""
 You are SatQuery AI, an assistant specialized in
 remote sensing and satellite image analysis.
@@ -165,6 +447,7 @@ User question:
 Describe only what can reasonably be observed in the image.
 
 Pay attention to visible features such as:
+
 - Vegetation
 - Buildings
 - Roads
@@ -174,100 +457,43 @@ Pay attention to visible features such as:
 - Urban areas
 - Other significant visible features
 
-Do not invent information that cannot be determined from
-the image.
+Do not invent information that cannot be determined
+from the image.
 """
 
-    # Send image bytes to Gemini
-    try:
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"VLM analysis failed: {repr(e)}"
-        )
-
-    # Return result
     return {
         "status": "success",
+        "route": route,
         "filename": image.filename,
         "query": query,
-        "analysis": analysis
+        "analysis": analysis,
     }
 
-# --------------------------------------------------
-# WHAT CHANGED - SATELLITE IMAGE COMPARISON
-# --------------------------------------------------
+
+# ============================================================
+# WHAT CHANGED
+# SATELLITE IMAGE COMPARISON
+# ============================================================
 
 @app.post("/api/change-detection")
 async def change_detection(
     old_image: UploadFile = File(...),
-    new_image: UploadFile = File(...)
+    new_image: UploadFile = File(...),
 ):
+    old_data = await read_and_validate_image(
+        old_image
+    )
 
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
+    new_data = await read_and_validate_image(
+        new_image
+    )
 
-    # Check old image
-    if old_image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Old image must be JPG, PNG or WEBP."
-        )
-
-    # Check new image
-    if new_image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="New image must be JPG, PNG or WEBP."
-        )
-
-    # Read images
-    old_data = await old_image.read()
-    new_data = await new_image.read()
-
-    if not old_data or not new_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Both images are required."
-        )
-
-    # Validate images
-    try:
-        old_img = Image.open(io.BytesIO(old_data))
-        old_img.verify()
-
-        new_img = Image.open(io.BytesIO(new_data))
-        new_img.verify()
-
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="One or both images are invalid."
-        )
-
-    # Comparison prompt
     prompt = """
 You are SatQuery AI, an assistant specialized in
 satellite and remote sensing image analysis.
@@ -279,7 +505,8 @@ The second image is the NEW image.
 
 Compare the two images carefully.
 
-Identify only changes that are visibly supported by the images.
+Identify only changes that are visibly supported
+by the images.
 
 Analyze these categories:
 
@@ -302,7 +529,8 @@ Do not invent changes that cannot be visually confirmed.
 Do not assume the exact dates of the images.
 Do not claim that construction is legal or illegal.
 
-Return the answer in a clear, simple format suitable for a normal user.
+Return the answer in a clear, simple format suitable
+for a normal user.
 """
 
     try:
@@ -310,38 +538,41 @@ Return the answer in a clear, simple format suitable for a normal user.
         response = client.models.generate_content(
             model="gemini-3.6-flash",
             contents=[
-                types.Part.from_text(text=prompt),
-
+                types.Part.from_text(
+                    text=prompt
+                ),
                 types.Part.from_text(
                     text="OLD IMAGE:"
                 ),
-
                 types.Part.from_bytes(
                     data=old_data,
-                    mime_type=old_image.content_type
+                    mime_type=old_image.content_type,
                 ),
-
                 types.Part.from_text(
                     text="NEW IMAGE:"
                 ),
-
                 types.Part.from_bytes(
                     data=new_data,
-                    mime_type=new_image.content_type
-                )
-            ]
+                    mime_type=new_image.content_type,
+                ),
+            ],
         )
 
         analysis = response.text
 
         if not analysis:
-            raise Exception("Gemini returned an empty response.")
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
 
     except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Change detection failed: {repr(e)}"
+            detail=(
+                "Change detection failed: "
+                f"{repr(e)}"
+            ),
         )
 
     return {
@@ -349,51 +580,22 @@ Return the answer in a clear, simple format suitable for a normal user.
         "feature": "What Changed?",
         "old_filename": old_image.filename,
         "new_filename": new_image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # FLOOD RISK ANALYSIS
-# --------------------------------------------------
+# ============================================================
 
 @app.post("/api/flood-risk")
 async def flood_risk(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
+    image_data = await read_and_validate_image(
+        image
+    )
 
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    # Check image type
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    # Read image
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    # Validate image
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
-
-    # Flood risk prompt
     prompt = """
 You are SatQuery AI, an assistant specialized in
 satellite and remote sensing image analysis.
@@ -420,6 +622,7 @@ LOW / MEDIUM / HIGH / UNCERTAIN
 Then explain the main visible reasons.
 
 IMPORTANT:
+
 - Only use evidence visible in the image.
 - Do not invent elevation, rainfall, drainage,
   historical flood records, or weather information.
@@ -431,75 +634,31 @@ IMPORTANT:
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Flood risk analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Flood Risk",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # CONSTRUCTION CHECK
-# --------------------------------------------------
+# ============================================================
 
 @app.post("/api/construction-check")
 async def construction_check(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
-
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
+    image_data = await read_and_validate_image(
+        image
+    )
 
     prompt = """
 You are SatQuery AI, specialized in satellite and
@@ -526,6 +685,7 @@ DETECTED / NOT CLEARLY DETECTED / UNCERTAIN
 Then explain the visible evidence in simple language.
 
 IMPORTANT:
+
 - Only describe what is visibly supported by the image.
 - Do not claim that construction is legal or illegal.
 - Do not determine ownership of land.
@@ -539,80 +699,32 @@ the relevant local authority.
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Construction analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Construction Check",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # ENVIRONMENT / GREENERY ANALYSIS
-# --------------------------------------------------
+# ============================================================
 
 @app.post("/api/environment")
 async def environment_analysis(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
+    image_data = await read_and_validate_image(
+        image
+    )
 
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    # Check image type
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    # Read image
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    # Validate image
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
-
-    # Environment analysis prompt
     prompt = """
 You are SatQuery AI, specialized in satellite and
 remote sensing image analysis.
@@ -643,6 +755,7 @@ Also describe the major environmental features
 visible in the image.
 
 IMPORTANT:
+
 - Only use evidence visible in the image.
 - Do not calculate NDVI from an ordinary RGB image.
 - Do not invent environmental measurements.
@@ -654,75 +767,31 @@ IMPORTANT:
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Environment analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Environment / Greenery",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # AGRICULTURE ANALYSIS
-# --------------------------------------------------
+# ============================================================
 
 @app.post("/api/agriculture")
 async def agriculture_analysis(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
-
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
+    image_data = await read_and_validate_image(
+        image
+    )
 
     prompt = """
 You are SatQuery AI, specialized in satellite and
@@ -754,6 +823,7 @@ GOOD / MIXED / SPARSE / UNCERTAIN
 Then explain the visible evidence.
 
 IMPORTANT:
+
 - Only use evidence visible in the image.
 - Do not identify the exact crop unless clearly visible.
 - Do not calculate NDVI from an ordinary RGB image.
@@ -764,75 +834,31 @@ IMPORTANT:
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agriculture analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Agriculture",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # DISASTER ASSESSMENT
-# --------------------------------------------------
+# ============================================================
 
 @app.post("/api/disaster")
 async def disaster_analysis(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
-
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
+    image_data = await read_and_validate_image(
+        image
+    )
 
     prompt = """
 You are SatQuery AI, specialized in satellite and
@@ -866,6 +892,7 @@ INFRASTRUCTURE DAMAGE / OTHER / NONE
 Then explain the visible evidence.
 
 IMPORTANT:
+
 - Only use evidence visible in the image.
 - Do not claim that an official disaster is occurring.
 - Do not invent weather, rainfall, earthquake,
@@ -879,43 +906,23 @@ IMPORTANT:
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Disaster analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Disaster Assessment",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
+
+
+# ============================================================
 # TRAFFIC ROUTE
-# --------------------------------------------------
-
-from pydantic import BaseModel
-
+# ============================================================
 
 class TrafficRouteRequest(BaseModel):
     start: str
@@ -923,18 +930,19 @@ class TrafficRouteRequest(BaseModel):
 
 
 @app.post("/api/traffic-route")
-async def traffic_route(request: TrafficRouteRequest):
-
+async def traffic_route(
+    request: TrafficRouteRequest,
+):
     if not request.start.strip():
         raise HTTPException(
             status_code=400,
-            detail="Starting location is required."
+            detail="Starting location is required.",
         )
 
     if not request.destination.strip():
         raise HTTPException(
             status_code=400,
-            detail="Destination is required."
+            detail="Destination is required.",
         )
 
     prompt = f"""
@@ -951,6 +959,7 @@ DESTINATION:
 Provide a simple route-planning response.
 
 Include:
+
 - Starting location
 - Destination
 - Suggested route
@@ -959,6 +968,7 @@ Include:
 - Road or traffic considerations if known
 
 IMPORTANT:
+
 You do not have access to live traffic data in this
 endpoint. Do not claim that traffic conditions are live
 or current.
@@ -973,19 +983,24 @@ Return the answer in simple language.
 
         response = client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=prompt
+            contents=prompt,
         )
 
         analysis = response.text
 
         if not analysis:
-            raise Exception("Gemini returned an empty response.")
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
 
     except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Traffic route analysis failed: {repr(e)}"
+            detail=(
+                "Traffic route analysis failed: "
+                f"{repr(e)}"
+            ),
         )
 
     return {
@@ -993,46 +1008,21 @@ Return the answer in simple language.
         "feature": "Traffic Route",
         "start": request.start,
         "destination": request.destination,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
-# PROPERTY INTELLIGENCE / CHECK MY AREA
-# --------------------------------------------------
+
+
+# ============================================================
+# PROPERTY INTELLIGENCE
+# ============================================================
 
 @app.post("/api/property-risk")
 async def property_risk(
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
 ):
-
-    allowed_types = [
-        "image/jpeg",
-        "image/png",
-        "image/jpg",
-        "image/webp"
-    ]
-
-    if image.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400,
-            detail="Only JPG, PNG and WEBP images are supported."
-        )
-
-    image_data = await image.read()
-
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Image file is empty."
-        )
-
-    try:
-        img = Image.open(io.BytesIO(image_data))
-        img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file."
-        )
+    image_data = await read_and_validate_image(
+        image
+    )
 
     prompt = """
 You are SatQuery AI, a satellite and remote sensing
@@ -1092,6 +1082,7 @@ THINGS TO INVESTIGATE:
 - Up to 4 important points.
 
 IMPORTANT:
+
 - Only use information visibly supported by the image.
 - Do not claim exact property ownership.
 - Do not determine whether construction is legal.
@@ -1109,55 +1100,61 @@ verification should be used before making a property decision.
 Return the answer in simple language.
 """
 
-    try:
-
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type=image.content_type
-                )
-            ]
-        )
-
-        analysis = response.text
-
-        if not analysis:
-            raise Exception("Gemini returned an empty response.")
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Property analysis failed: {repr(e)}"
-        )
+    analysis = await run_gemini_image_analysis(
+        image_data,
+        image.content_type,
+        prompt,
+    )
 
     return {
         "status": "success",
         "feature": "Property Intelligence",
         "filename": image.filename,
-        "analysis": analysis
+        "analysis": analysis,
     }
-# --------------------------------------------------
-# ASK SATQUERY - GENERAL AI CHAT
-# --------------------------------------------------
+
+
+# ============================================================
+# ASK SATQUERY - TEXT ONLY CHAT
+# ============================================================
 
 @app.post("/api/chat")
-async def ask_satquery(question: str = Form(...)):
+async def ask_satquery(
+    question: str = Form(...),
+):
     if not question.strip():
-        raise HTTPException(status_code=400, detail="Question is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="Question is required.",
+        )
 
     prompt = f"""
-You are SatQuery AI, an assistant specializing in remote sensing,
-satellite imagery, geography, environmental analysis, agriculture,
-and disaster assessment.
+You are SatQuery AI, a helpful AI assistant specializing in:
+
+- Remote sensing
+- Satellite imagery
+- Geography
+- Environmental analysis
+- Agriculture
+- Disaster assessment
+- Urban development
+- GIS concepts
+
+You are currently operating in TEXT-ONLY CHAT MODE.
 
 Answer the user's question clearly and accurately.
-If the question is general, answer it normally.
-Do not invent satellite data, live location data, property records,
-or information that you do not have.
+
+IMPORTANT:
+
+- You cannot see or analyze images through this chat endpoint.
+- Do not pretend that you can see an image.
+- If the user asks about a specific image that has not been
+  provided, explain briefly that you cannot inspect that image
+  through text-only chat.
+- For general questions about satellite imagery, remote sensing,
+  geography, and related topics, answer normally.
+- Do not invent satellite data, live location data, property
+  records, weather data, or other information you do not have.
 
 User question:
 {question}
@@ -1166,37 +1163,46 @@ User question:
     last_error = None
 
     for attempt in range(3):
+
         try:
+
             response = client.models.generate_content(
                 model="gemini-3.6-flash",
-                contents=prompt
+                contents=prompt,
             )
+
+            if not response.text:
+                raise ValueError(
+                    "Gemini returned an empty response."
+                )
 
             return {
                 "status": "success",
                 "feature": "Ask SatQuery",
                 "question": question,
-                "response": response.text
+                "response": response.text,
             }
 
         except Exception as e:
+
             last_error = e
 
             if attempt < 2:
-                import asyncio
                 await asyncio.sleep(2)
 
     raise HTTPException(
         status_code=503,
-        detail="SatQuery AI is temporarily busy. Please try again in a moment."
+        detail=(
+            "SatQuery AI is temporarily busy. "
+            "Please try again in a moment. "
+            f"Last error: {repr(last_error)}"
+        ),
     )
 
-# --------------------------------------------------
+
+# ============================================================
 # GPS LOCATION
-# --------------------------------------------------
-
-from pydantic import BaseModel
-
+# ============================================================
 
 class LocationRequest(BaseModel):
     latitude: float
@@ -1204,18 +1210,36 @@ class LocationRequest(BaseModel):
 
 
 @app.post("/api/location")
-async def save_location(location: LocationRequest):
-
+async def save_location(
+    location: LocationRequest,
+):
     return {
         "status": "success",
         "feature": "GPS Location",
         "latitude": location.latitude,
         "longitude": location.longitude,
-        "message": "Location received successfully."
+        "message": "Location received successfully.",
     }
-if __name__ == "__main__":
-    import uvicorn
-    import os
 
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ============================================================
+# RUN SERVER
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            8000,
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+    )
+
